@@ -19,8 +19,8 @@ from scipy import interpolate
 import itertools
 from sklearn.linear_model import LinearRegression
 
-from theano import tensor as tt
-from theano import function
+#from theano import tensor as tt
+#from theano import function
 
 def SumByGroup(groupid,x,shrink=0):
     nobs = groupid.size
@@ -69,98 +69,83 @@ alpha_j = np.array([5.,3.,10.])
 alpha_p = -5.
 P = np.random.randn(N_obs)
 lam = np.random.randn(N_obs)
-f = alpha_j[prodid]  +lam
-
-deltait = np.log( SumByGroup(t,np.exp(f+alpha_p*P),shrink=1) ).flatten()
-deltait_n = len(deltait)
-V = np.zeros(dgrid_n)
 
 beta = .8        
-
 tol_value_iter=.1
-
 delta_draw=np.random.randn(N_draw_E)
 #delta_draw=Halton_draw.halton_randn(1,N_draw_E)[:,0]       
 
 
 #%%
+def Calc_delta(P,lam):
+    f = alpha_j[prodid]  +lam    
+    deltait = np.log( SumByGroup(t,np.exp(f+alpha_p*P),shrink=1) ).flatten()
+    return deltait
+    
 
-
-
-#%% Test Value
-V_init = np.zeros(dgrid_n)
-V_old = V_init
-norm = tol_value_iter + 1000.
 #%%
 #Calculate AR1 process
-lr = LinearRegression(fit_intercept=True)
-lr.fit(deltait[:-1],deltait[1:])
-gamma0 = lr.intercept_
-gamma1 = lr.coef_        
-res = deltait[1:] - lr.predict(deltait[:-1])
-var_nu = np.var(res)
+def Calc_AR1(deltait):
+    lr = LinearRegression(fit_intercept=True)
+    lr.fit(deltait[:-1].reshape([-1,1]),deltait[1:].reshape([-1,1]))
+    gamma0 = lr.intercept_
+    gamma1 = lr.coef_        
+    res = deltait[1:] - lr.predict(deltait[:-1].reshape([-1,1])).flatten()
+    var_nu = np.var(res)
+    return gamma0,gamma1,var_nu
 
 #%%
-def gen_delta_next(delta_seq): #input a sequence of delta [delta1 delta2 ...], return [delta's for delta1, delta's for delta2,...]
-    delta_n=delta_seq.size
-    delta_next_stuck=(gamma0+gamma1*delta_seq).repeat(N_draw_E)+np.tile(delta_draw*np.sqrt(var_nu),delta_n) #as delta_n*N_draw_E vector.
-    delta_next=delta_next_stuck.reshape(delta_n,N_draw_E) # as delta_n by N_draw_E matrix.        
-    return delta_next,delta_next_stuck
+def gen_deltait_next(deltait_seq): #input a sequence of delta [delta1 delta2 ...], return [delta's for delta1, delta's for delta2,...]
+    deltait_n=deltait_seq.size
+    deltait_next_stuck=(gamma0+gamma1*deltait_seq).repeat(N_draw_E)+np.tile(delta_draw*np.sqrt(var_nu),deltait_n) #as delta_n*N_draw_E vector.
+    deltait_next=deltait_next_stuck.reshape(deltait_n,N_draw_E) # as delta_n by N_draw_E matrix.        
+    return deltait_next,deltait_next_stuck
 
-def Calc_EV(V,delta_seq):
-    delta_next,_ = gen_delta_next(delta_seq)
-    V_next = interpolate.griddata(dgrid, V, delta_next  )
+def Calc_EV(V,deltait_seq):
+    deltait_next,_ = gen_deltait_next(deltait_seq)
+    #V_next = interpolate.griddata(dgrid, V, delta_next  )
+    grid_interp = interpolate.UnivariateSpline(deltait_seq,V)
+    V_next = grid_interp(deltait_next  )
     ev = np.mean(V_next,axis=1).flatten() #return from delta_seq to EV for each delta
     return ev
 
 #%%
-def loop_val(deltait,V_init):
-    V_old = V_init
-    
-    EV_on_grid = 
+def loop_val(V_init):
+    V_old = copy.deepcopy(V_init)
+    norm = tol_value_iter+1000.
+    while norm>tol_value_iter:
+        EV_on_grid = Calc_EV(V_old, dgrid)
+        V_new = np.log( np.exp(dgrid)+np.exp(beta*EV_on_grid) )
+        norm = np.max(np.abs(V_new-V_old))  
+        V_old = copy.deepcopy(V_new)
+    return V_new
 
 #%%
-def loop_ar1_value_delta(V_init,deltait_init,Fj): #can loop until convergence, can loop for a couple of times    
-    deltait_old = deltait_init
-    V_old = V_init
-    deltait_n = deltait_init.shape[0]
-    #AR(1) regression
-    #value function iteration
-    V_new = value_iter(V_old)        
-    #delta iteration
-    deltait_new = deltait_iter(V_new,deltait_old,Fj)
-    return V_new, deltait_new
-        
+def V_delta_poly(dgrid,V):
+    coef=np.polyfit(dgrid,V,deg=2)
+    return coef
 
-def value_iter( V_init):
-    V_old = V_init
-    f_stuck = grids_list[:,0]
-    delta_stuck = grids_list[:,1]
-    norm = tol_value_iter + 1000.
-    while norm>tol_value_iter:            
-        V_new_stuck = np.log( np.exp( f_stuck + beta * EV(V_old, fgrid, dgrid) ) + np.exp(delta_stuck) )
-        V_new = V_new_stuck.reshape(fgrid_n,dgrid_n)
-        norm = np.max(np.abs(V_new - V_old))
-        V_old = V_new
-    return V_new
+def Calc_share_given_delta(deltait,delta_ijt,deltait,V):
+    ev = Calc_EV(V,deltait)
+    share_denom = (np.exp(deltait)+np.exp(beta*ev) )[t]
+    share_num = np.exp(delta_ijt)
+    share = share_num/share_denom
+    return share
+
+def Calc_FOC_error(P,V_init=copy.deepcopy(dgrid)):
+    deltait=Calc_delta(P,lam)
+    gamma0,gamma1,var_nu=Calc_AR1(deltait)
+    V = loop_val(V_init)
+    V_coef=V_delta_poly(dgrid,V)
+    foc_resid = 
+    return foc
+    
     
 
 
-#%%Test EV
-V = V_init
-f_seq=f_stuck
-delta_seq=delta_stuck
-
-f_n = f_seq.size
-delta_n = delta_seq.size
-delta_stuck = np.tile(delta_seq,f_n)
-_,delta_next_stuck = gen_delta_next(delta_stuck)
-f_stuck_EV = np.repeat(f_seq,delta_n*N_draw_E)
-V_stuck_EV = V.reshape(V.size,order='F') 
-V_next_stuck = interpolate.griddata(grids_list,V_stuck_EV,(f_stuck_EV,delta_next_stuck)) # as fgrid_n * dgrid_n vector
-V_next = V_next_stuck.reshape(f_n*delta_n,N_draw_E)
-ev_stuck = np.sum( V_next, axis=1 )
-ev = ev_stuck.reshape(f_n,delta_n) # as fgrid_n by dgrid_n matrix        
-
-
-
+if __name__=="__main__":
+    deltait=Calc_delta(P,lam)
+    gamma0,gamma1,var_nu=Calc_AR1(deltait)
+    V_init=copy.deepcopy(dgrid)
+    V = loop_val(V_init)
+    
